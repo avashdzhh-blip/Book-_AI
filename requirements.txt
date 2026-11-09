@@ -1,6 +1,8 @@
+
 streamlit
-openai
 pymupdf
 numpy
 pytesseract
 Pillow
+scikit-learn
+
