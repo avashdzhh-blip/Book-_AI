@@ -2,12 +2,10 @@
 import streamlit as st
 import fitz
 import pytesseract
-import numpy as np
 import re
 
 from PIL import Image
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from rank_bm25 import BM25Okapi
 
 
 st.set_page_config(
@@ -20,16 +18,30 @@ st.title("📚 Book AI")
 st.caption("دستیار هوشمند کتاب‌های شما")
 
 
+# یکسان‌سازی متن فارسی
 def normalize_text(text):
     text = text.replace("ي", "ی")
     text = text.replace("ك", "ک")
+    text = text.replace("ۀ", "ه")
+    text = text.replace("ة", "ه")
     text = text.replace("\u200c", " ")
+    text = re.sub(r"[ـ]", "", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
 
+# تبدیل متن به کلمات
+def tokenize(text):
+    text = normalize_text(text).lower()
+    return re.findall(r"[a-zA-Z0-9آ-ی]+", text)
+
+
+# استخراج متن PDF
 def extract_pdf(pdf_bytes):
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    doc = fitz.open(
+        stream=pdf_bytes,
+        filetype="pdf"
+    )
 
     pages = []
     progress = st.progress(0)
@@ -40,7 +52,7 @@ def extract_pdf(pdf_bytes):
     for i, page in enumerate(doc):
         text = page.get_text("text")
 
-        # OCR برای صفحات اسکن شده
+        # OCR فقط برای صفحات بدون متن کافی
         if len(text.strip()) < 40:
             pix = page.get_pixmap(
                 matrix=fitz.Matrix(1.5, 1.5),
@@ -68,7 +80,9 @@ def extract_pdf(pdf_bytes):
             })
 
         progress.progress((i + 1) / total)
-        status.write(f"در حال خواندن صفحه {i + 1} از {total}")
+        status.write(
+            f"در حال خواندن صفحه {i + 1} از {total}"
+        )
 
     progress.empty()
     status.empty()
@@ -77,44 +91,72 @@ def extract_pdf(pdf_bytes):
     return pages
 
 
-def create_chunks(pages, chunk_size=900, overlap=120):
+# تقسیم متن به بخش‌های کوچک‌تر
+def create_chunks(pages):
     chunks = []
 
     for item in pages:
-        text = item["text"]
+        sentences = re.split(
+            r"(?<=[.!؟?])\s+",
+            item["text"]
+        )
 
-        start = 0
+        current = ""
 
-        while start < len(text):
-            end = start + chunk_size
-            part = text[start:end].strip()
+        for sentence in sentences:
+            sentence = sentence.strip()
 
-            if len(part) > 30:
-                chunks.append({
-                    "page": item["page"],
-                    "text": part
-                })
+            if not sentence:
+                continue
 
-            start += chunk_size - overlap
+            if len(current) + len(sentence) < 700:
+                current += " " + sentence
+            else:
+                if len(current.strip()) > 20:
+                    chunks.append({
+                        "page": item["page"],
+                        "text": current.strip()
+                    })
+
+                current = sentence
+
+        if len(current.strip()) > 20:
+            chunks.append({
+                "page": item["page"],
+                "text": current.strip()
+            })
 
     return chunks
 
 
-def find_answer(question, chunks, vectorizer, matrix):
-    question = normalize_text(question)
+# ساخت موتور جست‌وجو
+def build_search(chunks):
+    tokenized_chunks = [
+        tokenize(chunk["text"])
+        for chunk in chunks
+    ]
 
-    question_vector = vectorizer.transform([question])
+    return BM25Okapi(tokenized_chunks)
 
-    scores = cosine_similarity(
-        question_vector,
-        matrix
-    ).flatten()
 
-    best_indexes = np.argsort(scores)[::-1]
+# پیدا کردن قسمت‌های مرتبط
+def find_answer(question, chunks, search_engine):
+    question_tokens = tokenize(question)
+
+    if not question_tokens:
+        return []
+
+    scores = search_engine.get_scores(question_tokens)
+
+    indexes = sorted(
+        range(len(scores)),
+        key=lambda i: scores[i],
+        reverse=True
+    )
 
     results = []
 
-    for index in best_indexes[:5]:
+    for index in indexes[:5]:
         if scores[index] <= 0:
             continue
 
@@ -127,19 +169,18 @@ def find_answer(question, chunks, vectorizer, matrix):
     return results
 
 
+# اطلاعات کاربران در نشست جداگانه
 if "chunks" not in st.session_state:
     st.session_state.chunks = None
 
-if "vectorizer" not in st.session_state:
-    st.session_state.vectorizer = None
-
-if "matrix" not in st.session_state:
-    st.session_state.matrix = None
+if "search_engine" not in st.session_state:
+    st.session_state.search_engine = None
 
 if "book_name" not in st.session_state:
     st.session_state.book_name = None
 
 
+# آپلود کتاب
 st.subheader("📖 آپلود کتاب")
 
 uploaded_file = st.file_uploader(
@@ -168,46 +209,40 @@ if uploaded_file is not None:
                     st.error("متن کافی برای جست‌وجو پیدا نشد.")
                     st.stop()
 
-                vectorizer = TfidfVectorizer(
-                    analyzer="word",
-                    ngram_range=(1, 2),
-                    max_features=50000,
-                    sublinear_tf=True
-                )
-
-                matrix = vectorizer.fit_transform(
-                    [item["text"] for item in chunks]
-                )
+                search_engine = build_search(chunks)
 
                 st.session_state.chunks = chunks
-                st.session_state.vectorizer = vectorizer
-                st.session_state.matrix = matrix
+                st.session_state.search_engine = search_engine
                 st.session_state.book_name = uploaded_file.name
 
             st.success("کتاب با موفقیت پردازش شد! 🎉")
+
             st.write(f"تعداد صفحات خوانده‌شده: {len(pages)}")
-            st.write(f"تعداد بخش‌های آماده جست‌وجو: {len(chunks)}")
+            st.write(f"تعداد بخش‌های کتاب: {len(chunks)}")
 
         except Exception as e:
-            st.error("هنگام پردازش کتاب خطایی رخ داد.")
+            st.error("خطا هنگام پردازش کتاب:")
             st.exception(e)
 
 
 st.divider()
 
+# پرسش از کتاب
 st.subheader("💬 از کتاب سؤال بپرس")
 
 if st.session_state.chunks is None:
 
-    st.info("ابتدا یک کتاب PDF آپلود و پردازش کنید.")
+    st.info("ابتدا یک کتاب آپلود و پردازش کنید.")
 
 else:
 
-    st.caption(f"کتاب فعلی: {st.session_state.book_name}")
+    st.caption(
+        f"کتاب فعلی: {st.session_state.book_name}"
+    )
 
     question = st.text_input(
         "سؤال خود را بنویسید:",
-        placeholder="مثلاً فتوسنتز چیست؟"
+        placeholder="مثلاً یاخته چیست؟"
     )
 
     if st.button("پیدا کردن پاسخ"):
@@ -219,34 +254,33 @@ else:
             results = find_answer(
                 question,
                 st.session_state.chunks,
-                st.session_state.vectorizer,
-                st.session_state.matrix
+                st.session_state.search_engine
             )
 
             if not results:
                 st.warning(
-                    "قسمت مرتبطی در متن کتاب پیدا نشد."
+                    "قسمت مرتبطی در کتاب پیدا نشد."
                 )
 
             else:
-                st.subheader("📚 پاسخ‌های پیدا شده از کتاب")
+                st.subheader("📚 قسمت‌های مرتبط کتاب")
 
                 for i, result in enumerate(results, 1):
 
                     with st.expander(
-                        f"نتیجه {i} - صفحه {result['page']}",
+                        f"نتیجه {i} | صفحه {result['page']}",
                         expanded=(i == 1)
                     ):
 
                         st.write(result["text"])
 
                         st.caption(
-                            f"صفحه {result['page']}"
+                            f"شماره صفحه: {result['page']}"
                         )
 
                 st.info(
-                    "این بخش‌ها مستقیماً از متن کتاب استخراج شده‌اند. "
-                    "برای پاسخ دقیق‌تر، متن صفحات نمایش‌داده‌شده را بررسی کنید."
+                    "متن‌های بالا از کتاب استخراج شده‌اند. "
+                    "پاسخ نهایی را با توجه به متن کتاب بررسی کنید."
                 )
                 
 
