@@ -80,7 +80,7 @@ def extract_page_text(page):
 
     # تبدیل صفحه PDF به تصویر
     pix = page.get_pixmap(
-        matrix=fitz.Matrix(2, 2),
+        matrix=fitz.Matrix(1.5, 1.5),
         alpha=False
     )
 
