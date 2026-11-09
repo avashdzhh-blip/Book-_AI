@@ -1,8 +1,10 @@
-
 import streamlit as st
 import fitz
 import numpy as np
 import hashlib
+import pytesseract
+
+from PIL import Image
 from openai import OpenAI
 
 st.set_page_config(
@@ -14,16 +16,14 @@ st.set_page_config(
 st.title("📚 Book AI")
 st.write("دستیار هوشمند کتاب‌های شما")
 
-# اتصال به هوش مصنوعی
 if "OPENAI_API_KEY" not in st.secrets:
-    st.error("کلید اتصال هوش مصنوعی تنظیم نشده است.")
+    st.error("کلید API تنظیم نشده است.")
     st.stop()
 
 client = OpenAI(
     api_key=st.secrets["OPENAI_API_KEY"]
 )
 
-# اطلاعات ذخیره‌شده
 if "chunks" not in st.session_state:
     st.session_state.chunks = []
 
@@ -34,7 +34,6 @@ if "processed_signature" not in st.session_state:
     st.session_state.processed_signature = None
 
 
-# تقسیم متن به قسمت‌های کوچک
 def split_text(text, size=1200, overlap=150):
     step = size - overlap
 
@@ -45,7 +44,6 @@ def split_text(text, size=1200, overlap=150):
     ]
 
 
-# ساخت امبدینگ
 def get_embeddings(texts):
     result = []
 
@@ -62,7 +60,6 @@ def get_embeddings(texts):
     return np.array(result, dtype=np.float32)
 
 
-# شناسایی فایل‌های انتخاب‌شده
 def get_signature(files):
     signature = hashlib.sha256()
 
@@ -73,14 +70,42 @@ def get_signature(files):
     return signature.hexdigest()
 
 
-# آپلود کتاب
+# استخراج متن با OCR در صورت نیاز
+def extract_page_text(page):
+
+    text = page.get_text("text").strip()
+
+    if text:
+        return text
+
+    # تبدیل صفحه PDF به تصویر
+    pix = page.get_pixmap(
+        matrix=fitz.Matrix(2, 2),
+        alpha=False
+    )
+
+    image = Image.frombytes(
+        "RGB",
+        [pix.width, pix.height],
+        pix.samples
+    )
+
+    # تشخیص نوشته فارسی و انگلیسی
+    text = pytesseract.image_to_string(
+        image,
+        lang="fas+eng",
+        config="--psm 6"
+    )
+
+    return text.strip()
+
+
 st.header("📖 آپلود کتاب")
 
 files = st.file_uploader(
     "کتاب‌های PDF را انتخاب کنید",
     type=["pdf"],
-    accept_multiple_files=True,
-    key="book_uploader"
+    accept_multiple_files=True
 )
 
 current_signature = get_signature(files) if files else None
@@ -88,10 +113,7 @@ current_signature = get_signature(files) if files else None
 if files:
     st.success(f"{len(files)} فایل انتخاب شده است.")
 
-    if current_signature != st.session_state.processed_signature:
-        st.info("برای آماده‌سازی کتاب‌ها، دکمه پردازش را بزنید.")
 
-# پردازش کتاب‌ها
 if st.button("📚 پردازش کتاب‌ها", use_container_width=True):
 
     if not files:
@@ -99,72 +121,82 @@ if st.button("📚 پردازش کتاب‌ها", use_container_width=True):
 
     else:
         chunks = []
-        empty_books = []
 
         try:
-            with st.spinner("در حال خواندن و پردازش کتاب‌ها..."):
+            total_pages = 0
+
+            for file in files:
+                pdf = fitz.open(
+                    stream=file.getvalue(),
+                    filetype="pdf"
+                )
+                total_pages += len(pdf)
+                pdf.close()
+
+            progress = st.progress(0)
+            status = st.empty()
+
+            processed_pages = 0
+
+            with st.spinner("در حال خواندن کتاب‌ها..."):
 
                 for file in files:
+
                     pdf = fitz.open(
                         stream=file.getvalue(),
                         filetype="pdf"
                     )
 
-                    book_chunks = []
-
                     for page_num, page in enumerate(pdf):
-                        text = page.get_text("text")
+
+                        text = extract_page_text(page)
 
                         for part in split_text(text):
-                            book_chunks.append({
+                            chunks.append({
                                 "text": part,
                                 "book": file.name,
                                 "page": page_num + 1
                             })
 
-                    pdf.close()
+                        processed_pages += 1
 
-                    if not book_chunks:
-                        empty_books.append(file.name)
-
-                    chunks.extend(book_chunks)
-
-                if not chunks:
-                    st.error(
-                        "متنی از PDF پیدا نشد. "
-                        "ممکن است فایل اسکن‌شده باشد."
-                    )
-
-                    st.session_state.chunks = []
-                    st.session_state.vectors = None
-                    st.session_state.processed_signature = None
-
-                else:
-                    texts = [item["text"] for item in chunks]
-
-                    st.write("در حال اتصال به هوش مصنوعی...")
-
-                    vectors = get_embeddings(texts)
-
-                    st.session_state.chunks = chunks
-                    st.session_state.vectors = vectors
-                    st.session_state.processed_signature = current_signature
-
-                    st.success("✅ کتاب‌ها با موفقیت آماده شدند!")
-
-                    if empty_books:
-                        st.warning(
-                            "از این فایل‌ها متنی استخراج نشد: "
-                            + ", ".join(empty_books)
+                        progress.progress(
+                            processed_pages / total_pages
                         )
 
+                        status.write(
+                            f"در حال پردازش صفحه "
+                            f"{processed_pages} از {total_pages}"
+                        )
+
+                    pdf.close()
+
+            if not chunks:
+                st.error("هیچ متنی از کتاب استخراج نشد.")
+
+            else:
+                texts = [item["text"] for item in chunks]
+
+                with st.spinner("در حال آماده‌سازی هوش مصنوعی..."):
+                    vectors = get_embeddings(texts)
+
+                st.session_state.chunks = chunks
+                st.session_state.vectors = vectors
+                st.session_state.processed_signature = current_signature
+
+                st.success("✅ کتاب‌ها با موفقیت آماده شدند!")
+
+                st.info(
+                    f"تعداد بخش‌های استخراج‌شده: {len(chunks)}"
+                )
+
         except Exception as e:
-            st.error("هنگام پردازش کتاب‌ها خطایی رخ داد.")
+            st.error("خطا هنگام پردازش کتاب:")
             st.exception(e)
 
 
-# پرسش و پاسخ
 st.divider()
+
 st.header("💬 از کتابت سؤال بپرس")
 
 question = st.text_input("سؤالت را بنویس:")
@@ -172,13 +204,13 @@ question = st.text_input("سؤالت را بنویس:")
 if st.button("ارسال سؤال", use_container_width=True):
 
     if not question.strip():
-        st.warning("لطفاً سؤال خود را وارد کن.")
+        st.warning("سؤال را وارد کن.")
 
     elif not files:
-        st.warning("ابتدا کتاب‌ها را انتخاب و پردازش کن.")
+        st.warning("ابتدا کتاب‌ها را انتخاب کن.")
 
     elif current_signature != st.session_state.processed_signature:
-        st.warning("کتاب‌های انتخاب‌شده هنوز پردازش نشده‌اند.")
+        st.warning("ابتدا کتاب‌های انتخاب‌شده را پردازش کن.")
 
     elif not st.session_state.chunks:
         st.warning("ابتدا کتاب‌ها را پردازش کن.")
@@ -249,7 +281,7 @@ if st.button("ارسال سؤال", use_container_width=True):
                     st.write("📖", source)
 
         except Exception as e:
-            st.error("هنگام دریافت پاسخ خطایی رخ داد.")
+            st.error("خطا هنگام دریافت پاسخ:")
             st.exception(e)
 
               
